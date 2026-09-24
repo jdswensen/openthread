@@ -568,6 +568,16 @@ static bool IsOmrAddress(otInstance *aInstance, const otIp6AddressInfo &aAddress
 }
 #endif
 
+static bool IsMeshLocalLocator(const otIp6AddressInfo &aAddressInfo)
+{
+    // RLOC and ALOC addresses use the reserved IID `0000:00ff:fe00:xxxx`
+    // (where `xxxx` is the RLOC16 or ALOC16).
+    static const uint8_t kLocatorIid[] = {0x00, 0x00, 0x00, 0xff, 0xfe, 0x00};
+
+    return aAddressInfo.mMeshLocal &&
+           (memcmp(&aAddressInfo.mAddress->mFields.m8[8], kLocatorIid, sizeof(kLocatorIid)) == 0);
+}
+
 struct PendingRemoveAddress
 {
     bool Matches(const otIp6AddressInfo &aAddressInfo) const
@@ -707,9 +717,18 @@ static void UpdateUnicastLinux(otInstance *aInstance, const otIp6AddressInfo &aA
     {
         struct ifa_cacheinfo cacheinfo;
 
+        // RLOC and ALOC addresses are added with a zero preferred lifetime
+        // (deprecated) so that the kernel never selects them as the source
+        // address for host-originated traffic (RFC 6724, rule 3). An ALOC
+        // may be assigned on multiple devices (e.g., the Service ALOC on
+        // every BR advertising the same service), so a response sent to an
+        // ALOC source can be delivered to the wrong device.
         memset(&cacheinfo, 0, sizeof(cacheinfo));
-        cacheinfo.ifa_valid    = UINT32_MAX;
-        cacheinfo.ifa_prefered = (aAddressInfo.mPreferred && aAddressInfo.mScope != kLinkLocalScope) ? UINT32_MAX : 0;
+        cacheinfo.ifa_valid = UINT32_MAX;
+        cacheinfo.ifa_prefered =
+            (aAddressInfo.mPreferred && aAddressInfo.mScope != kLinkLocalScope && !IsMeshLocalLocator(aAddressInfo))
+                ? UINT32_MAX
+                : 0;
 
         AddRtAttr(&req.nh, sizeof(req), IFA_CACHEINFO, &cacheinfo, sizeof(cacheinfo));
     }
