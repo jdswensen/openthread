@@ -1,0 +1,118 @@
+#!/usr/bin/expect -f
+#
+#  Copyright (c) 2026, The OpenThread Authors.
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions are met:
+#  1. Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#  2. Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the distribution.
+#  3. Neither the name of the copyright holder nor the
+#     names of its contributors may be used to endorse or promote products
+#     derived from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+#  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+#  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+#  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+#  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+#  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+#  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+#  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+#  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+#  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+#  POSSIBILITY OF SUCH DAMAGE.
+#
+
+# This script verifies that RLOC and ALOC addresses are added to the host
+# netif as deprecated so that the kernel never selects them as the source
+# address for host-originated traffic, while the ML-EID stays preferred.
+
+source "tests/scripts/expect/_common.exp"
+
+skip_on_macos
+
+# Expands an IPv6 address to its full eight-group form with leading zeros
+# stripped, so that addresses printed by the OT CLI and by `ip` compare equal.
+proc expand_ip6 {addr} {
+    set idx [string first "::" $addr]
+    if {$idx >= 0} {
+        set left [string range $addr 0 [expr {$idx - 1}]]
+        set right [string range $addr [expr {$idx + 2}] end]
+        set lparts [expr {$left eq "" ? [list] : [split $left ":"]}]
+        set rparts [expr {$right eq "" ? [list] : [split $right ":"]}]
+        set parts [concat $lparts [lrepeat [expr {8 - [llength $lparts] - [llength $rparts]}] 0] $rparts]
+    } else {
+        set parts [split $addr ":"]
+    }
+
+    set out {}
+    foreach part $parts {
+        lappend out [format %x [expr 0x$part]]
+    }
+    return [join $out ":"]
+}
+
+# Matches the reserved RLOC/ALOC IID `0000:00ff:fe00:xxxx` in an address
+# expanded by `expand_ip6`.
+set locator_pattern {^([0-9a-f]{1,4}:){4}0:ff:fe00:[0-9a-f]{1,4}$}
+
+spawn_node 1
+
+send "netif\n"
+expect -re {[\r\n]([^\r\n:]+?):\d+}
+set netif_name $expect_out(1,string)
+expect_line "Done"
+
+setup_leader
+
+set mleid [expand_ip6 [get_ipaddr mleid]]
+
+# Wait for the leader's RLOC and Leader ALOC to be synced to the host netif.
+for {set i 0} {$i < 10} {incr i} {
+    set locator_count 0
+    foreach line [split [exec ip -6 addr show dev $netif_name] "\n"] {
+        if {[regexp {inet6 ([0-9a-f:]+)/\d+} $line - addr]
+            && [regexp $locator_pattern [expand_ip6 $addr]]} {
+            incr locator_count
+        }
+    }
+    if {$locator_count >= 2} {
+        break
+    }
+    sleep 1
+}
+
+if {$locator_count < 2} {
+    fail "Expected at least 2 locator addresses (RLOC and Leader ALOC) on $netif_name, found $locator_count"
+}
+
+set mleid_seen 0
+foreach line [split [exec ip -6 addr show dev $netif_name] "\n"] {
+    if {![regexp {inet6 ([0-9a-f:]+)/\d+} $line - addr]} {
+        continue
+    }
+
+    set addr [expand_ip6 $addr]
+    set is_deprecated [string match "*deprecated*" $line]
+
+    if {[regexp $locator_pattern $addr]} {
+        if {!$is_deprecated} {
+            fail "Locator address $addr is not deprecated"
+        }
+    } elseif {$addr == $mleid} {
+        set mleid_seen 1
+        if {$is_deprecated} {
+            fail "ML-EID $addr must not be deprecated"
+        }
+    }
+}
+
+if {!$mleid_seen} {
+    fail "ML-EID $mleid not found on $netif_name"
+}
+
+dispose_all
